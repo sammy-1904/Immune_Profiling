@@ -1,0 +1,10 @@
+# replace these with your own dependencies and versions
+pytest~=8.4.2
+pandas~=2.3.2
+numpy~=2.3.2
+tqdm~=4.67.1
+torch~=2.8.0
+torch>=2.0.0
+torchvision
+tqdm
+esm>=3.0.0   # optional: only if you plan to use ESM pretrained models
