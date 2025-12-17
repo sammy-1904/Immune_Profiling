@@ -113,6 +113,96 @@ class GeneEncoder:
         return self.j_encoder.get(j_gene, self.j_encoder['UNK'])
 
 
+# ============================================================================
+# PYTORCH DATASET FOR REPERTOIRE DATA
+# ============================================================================
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+
+
+class RepertoireDataset(Dataset):
+    """PyTorch Dataset for loading repertoire data with multimodal encoding."""
+    
+    def __init__(
+        self,
+        repertoire_data: List[dict],
+        gene_encoder: GeneEncoder,
+        max_seq_len: int = 20,
+        max_clonotypes: int = 2000,
+        is_train: bool = True
+    ):
+        self.repertoire_data = repertoire_data
+        self.gene_encoder = gene_encoder
+        self.max_seq_len = max_seq_len
+        self.max_clonotypes = max_clonotypes
+        self.is_train = is_train
+        
+    def __len__(self):
+        return len(self.repertoire_data)
+    
+    def __getitem__(self, idx):
+        rep = self.repertoire_data[idx]
+        df = rep['data']
+        
+        # Sample or truncate clonotypes
+        if len(df) > self.max_clonotypes:
+            if 'templates' in df.columns:
+                df = df.nlargest(self.max_clonotypes, 'templates')
+            else:
+                df = df.sample(n=self.max_clonotypes, random_state=42)
+        
+        n_seqs = len(df)
+        
+        # Initialize arrays
+        seq_encodings = np.zeros((self.max_clonotypes, self.max_seq_len, 5), dtype=np.float32)
+        v_indices = np.zeros(self.max_clonotypes, dtype=np.int64)
+        j_indices = np.zeros(self.max_clonotypes, dtype=np.int64)
+        mask = np.zeros(self.max_clonotypes, dtype=np.float32)
+        
+        # Encode each sequence
+        for i, row in enumerate(df.itertuples(index=False)):
+            if i >= self.max_clonotypes:
+                break
+                
+            seq = str(row.junction_aa) if pd.notna(row.junction_aa) else ''
+            seq_encodings[i] = encode_sequence_atchley(seq, self.max_seq_len)
+            v_indices[i] = self.gene_encoder.transform_v(row.v_call)
+            j_indices[i] = self.gene_encoder.transform_j(row.j_call)
+            mask[i] = 1.0
+        
+        result = {
+            'seq_encodings': torch.tensor(seq_encodings),
+            'v_indices': torch.tensor(v_indices),
+            'j_indices': torch.tensor(j_indices),
+            'mask': torch.tensor(mask),
+            'n_seqs': n_seqs,
+            'repertoire_id': rep['repertoire_id'],
+        }
+        
+        if self.is_train and rep.get('label') is not None:
+            result['label'] = torch.tensor(float(rep['label']), dtype=torch.float32)
+        
+        return result
+
+
+def collate_fn(batch):
+    """Custom collate function for batching repertoire data."""
+    result = {
+        'seq_encodings': torch.stack([b['seq_encodings'] for b in batch]),
+        'v_indices': torch.stack([b['v_indices'] for b in batch]),
+        'j_indices': torch.stack([b['j_indices'] for b in batch]),
+        'mask': torch.stack([b['mask'] for b in batch]),
+        'n_seqs': [b['n_seqs'] for b in batch],
+        'repertoire_id': [b['repertoire_id'] for b in batch],
+    }
+    
+    if 'label' in batch[0]:
+        result['label'] = torch.stack([b['label'] for b in batch])
+    
+    return result
+
+
 def load_data_generator(data_dir: str, metadata_filename='metadata.csv') -> Iterator[
     Union[Tuple[str, pd.DataFrame, bool], Tuple[str, pd.DataFrame]]]:
     """
