@@ -433,21 +433,49 @@ class ImmuneStatePredictor:
             pd.DataFrame: A DataFrame with 'ID', 'dataset', 'label_positive_probability', 'junction_aa', 'v_call', 'j_call' columns.
         """
         print(f"Making predictions for data in {test_dir_path}...")
-        if self.model is None:
+        if not self.models:
             raise RuntimeError("The model has not been fitted yet. Please call `fit` first.")
 
         # --- your code starts here ---
-
-        # Example: Load the data. One possibility could be to use the provided utility function as shown below.
-
-        # full_test_dataset_df = load_full_dataset(test_dir_path)
-        repertoire_ids = get_repertoire_ids(test_dir_path)  # Replace with actual repertoire IDs from the test data
-
-        # Prediction
-        #    Example:
-        # draw random probabilities for demonstration purposes
-
-        probabilities = np.random.rand(len(repertoire_ids)) # Replace with true predicted probabilities from your model
+        
+        # Load test data
+        full_df = load_full_dataset(test_dir_path)
+        repertoire_ids = full_df['repertoire_id'].unique()
+        
+        probabilities = []
+        
+        for rep_id in tqdm(repertoire_ids, desc="Predicting"):
+            rep_df = full_df[full_df['repertoire_id'] == rep_id]
+            
+            # Sample sequences
+            if len(rep_df) > self.max_clonotypes:
+                rep_df = rep_df.nlargest(self.max_clonotypes, 'duplicate_count')
+            
+            sequences = rep_df['junction_aa'].tolist()
+            v_calls = rep_df['v_call'].tolist()
+            j_calls = rep_df['j_call'].tolist()
+            
+            # Encode sequences
+            seq_encodings = []
+            for seq in sequences:
+                enc = encode_sequence_atchley(seq, self.max_seq_len)
+                seq_encodings.append(enc)
+            
+            seq_tensor = torch.tensor(np.array(seq_encodings), dtype=torch.float32).unsqueeze(0).to(self.device)
+            v_tensor = torch.tensor([self.gene_encoder.encode_v(v) for v in v_calls], dtype=torch.long).unsqueeze(0).to(self.device)
+            j_tensor = torch.tensor([self.gene_encoder.encode_j(j) for j in j_calls], dtype=torch.long).unsqueeze(0).to(self.device)
+            mask = torch.ones(1, len(sequences), dtype=torch.float32).to(self.device)
+            
+            # Ensemble prediction
+            all_probs = []
+            with torch.no_grad():
+                for model in self.models:
+                    logits, _ = model(seq_tensor, v_tensor, j_tensor, mask)
+                    prob = torch.sigmoid(logits).cpu().numpy()[0]
+                    all_probs.append(prob)
+            
+            avg_prob = np.mean(all_probs)
+            probabilities.append(avg_prob)
 
         # --- your code ends here ---
 
