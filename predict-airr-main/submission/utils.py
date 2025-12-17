@@ -70,6 +70,49 @@ def encode_sequence_atchley(seq: str, max_len: int = 25) -> np.ndarray:
     return np.array(encoding, dtype=np.float32)
 
 
+class GeneEncoder:
+    """Encoder for V/J gene calls to numerical indices."""
+    
+    def __init__(self):
+        self.v_encoder = None
+        self.j_encoder = None
+        self.v_classes = []
+        self.j_classes = []
+        self.n_v_genes = 0
+        self.n_j_genes = 0
+        
+    def fit(self, v_genes: List[str], j_genes: List[str]):
+        """Fit encoder on V and J gene lists."""
+        # Clean and get unique genes
+        v_genes_clean = list(set([str(g) if pd.notna(g) else 'UNK' for g in v_genes]))
+        j_genes_clean = list(set([str(g) if pd.notna(g) else 'UNK' for g in j_genes]))
+        
+        # Add UNK if not present
+        if 'UNK' not in v_genes_clean:
+            v_genes_clean.append('UNK')
+        if 'UNK' not in j_genes_clean:
+            j_genes_clean.append('UNK')
+        
+        self.v_classes = sorted(v_genes_clean)
+        self.j_classes = sorted(j_genes_clean)
+        
+        self.v_encoder = {g: i for i, g in enumerate(self.v_classes)}
+        self.j_encoder = {g: i for i, g in enumerate(self.j_classes)}
+        
+        self.n_v_genes = len(self.v_classes)
+        self.n_j_genes = len(self.j_classes)
+        
+    def transform_v(self, v_gene: str) -> int:
+        """Transform V gene to index."""
+        v_gene = str(v_gene) if pd.notna(v_gene) else 'UNK'
+        return self.v_encoder.get(v_gene, self.v_encoder['UNK'])
+            
+    def transform_j(self, j_gene: str) -> int:
+        """Transform J gene to index."""
+        j_gene = str(j_gene) if pd.notna(j_gene) else 'UNK'
+        return self.j_encoder.get(j_gene, self.j_encoder['UNK'])
+
+
 def load_data_generator(data_dir: str, metadata_filename='metadata.csv') -> Iterator[
     Union[Tuple[str, pd.DataFrame, bool], Tuple[str, pd.DataFrame]]]:
     """
