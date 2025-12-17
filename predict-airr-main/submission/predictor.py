@@ -1,9 +1,184 @@
 import os
+import gc
+import glob
 import numpy as np
 import pandas as pd
 import torch
-from submission.utils import load_data_generator, load_full_dataset, get_repertoire_ids, \
-    generate_random_top_sequences_df
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+from tqdm import tqdm
+
+from submission.utils import (
+    load_data_generator, load_full_dataset, get_repertoire_ids,
+    generate_random_top_sequences_df, encode_sequence_atchley,
+    GeneEncoder, RepertoireDataset, collate_fn
+)
+
+
+# ============================================================================
+# NEURAL NETWORK MODULES
+# ============================================================================
+
+class SequenceEncoder(nn.Module):
+    """CNN-based encoder for CDR3 sequences with multi-scale convolutions."""
+    
+    def __init__(self, input_dim: int = 5, hidden_dim: int = 96, dropout: float = 0.25):
+        super().__init__()
+        
+        # Multi-scale CNN for motif detection
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim // 2, kernel_size=3, padding=1),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(input_dim, hidden_dim // 2, kernel_size=5, padding=2),
+            nn.BatchNorm1d(hidden_dim // 2),
+            nn.ReLU(),
+        )
+        
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        self.output_dim = hidden_dim
+        
+    def forward(self, x):
+        # x: (batch, seq_len, input_dim)
+        x = x.transpose(1, 2)  # (batch, input_dim, seq_len)
+        
+        c3 = self.conv3(x)
+        c5 = self.conv5(x)
+        x = torch.cat([c3, c5], dim=1)  # (batch, hidden_dim, seq_len)
+        
+        # Global max pooling
+        x = x.max(dim=2)[0]  # (batch, hidden_dim)
+        x = self.projection(x)
+        return x
+
+
+class GeneEmbedding(nn.Module):
+    """Embedding layer for V and J genes."""
+    
+    def __init__(self, n_v_genes: int, n_j_genes: int, embed_dim: int = 24):
+        super().__init__()
+        self.v_embedding = nn.Embedding(n_v_genes, embed_dim, padding_idx=0)
+        self.j_embedding = nn.Embedding(n_j_genes, embed_dim, padding_idx=0)
+        self.output_dim = embed_dim * 2
+        
+    def forward(self, v_idx, j_idx):
+        v_emb = self.v_embedding(v_idx)
+        j_emb = self.j_embedding(j_idx)
+        return torch.cat([v_emb, j_emb], dim=-1)
+
+
+class GatedAttention(nn.Module):
+    """Gated attention mechanism for Multi-Instance Learning."""
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 96, dropout: float = 0.25):
+        super().__init__()
+        
+        self.attention_V = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.Tanh())
+        self.attention_U = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.Sigmoid())
+        self.attention_w = nn.Linear(hidden_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        # x: (batch, n_instances, input_dim)
+        V = self.attention_V(x)
+        U = self.attention_U(x)
+        A = self.attention_w(V * U)  # (batch, n_instances, 1)
+        
+        if mask is not None:
+            A = A.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
+        
+        attention_scores = F.softmax(A, dim=1)
+        attention_scores = self.dropout(attention_scores)
+        
+        # Weighted sum
+        bag_repr = torch.sum(attention_scores * x, dim=1)
+        return bag_repr, attention_scores.squeeze(-1)
+
+
+class MILClassifier(nn.Module):
+    """Multi-Instance Learning classifier combining sequence and gene features."""
+    
+    def __init__(self, n_v_genes: int, n_j_genes: int, seq_hidden: int = 96,
+                 gene_embed: int = 24, attention_hidden: int = 96, dropout: float = 0.25):
+        super().__init__()
+        
+        self.seq_encoder = SequenceEncoder(input_dim=5, hidden_dim=seq_hidden, dropout=dropout)
+        self.gene_encoder = GeneEmbedding(n_v_genes, n_j_genes, gene_embed)
+        
+        fused_dim = self.seq_encoder.output_dim + self.gene_encoder.output_dim
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(fused_dim, attention_hidden),
+            nn.LayerNorm(attention_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.attention = GatedAttention(attention_hidden, attention_hidden, dropout)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(attention_hidden, attention_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(attention_hidden, 1)
+        )
+        
+    def forward(self, seq_encodings, v_indices, j_indices, mask):
+        batch_size, n_seqs, seq_len, input_dim = seq_encodings.shape
+        
+        # Encode sequences
+        seq_flat = seq_encodings.view(batch_size * n_seqs, seq_len, input_dim)
+        seq_features = self.seq_encoder(seq_flat)
+        seq_features = seq_features.view(batch_size, n_seqs, -1)
+        
+        # Encode genes
+        gene_features = self.gene_encoder(v_indices, j_indices)
+        
+        # Fuse features
+        fused = torch.cat([seq_features, gene_features], dim=-1)
+        fused = self.fusion(fused)
+        
+        # Attention aggregation
+        bag_repr, attention_scores = self.attention(fused, mask)
+        
+        # Classify
+        logits = self.classifier(bag_repr).squeeze(-1)
+        return logits, attention_scores
+
+
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
+
+class CombinedLoss(nn.Module):
+    """Combined loss with focal loss and AUC optimization."""
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        
+    def forward(self, logits, labels, attention_scores=None, mask=None):
+        # Focal loss
+        probs = torch.sigmoid(logits)
+        ce_loss = F.binary_cross_entropy_with_logits(logits, labels, reduction='none')
+        p_t = probs * labels + (1 - probs) * (1 - labels)
+        focal_weight = (1 - p_t) ** self.gamma
+        focal_loss = (self.alpha * focal_weight * ce_loss).mean()
+        
+        return focal_loss
 
 
 class ImmuneStatePredictor:
