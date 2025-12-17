@@ -507,16 +507,31 @@ class ImmuneStatePredictor:
         """
 
         # --- your code starts here ---
-        # Return the top k sequences, sorted based on some form of importance score.
-        # Example:
-        # all_sequences_scored = self._score_all_sequences()
-        all_sequences_scored = generate_random_top_sequences_df(n_seq=top_k)  # Replace with your way of identifying top k sequences
-        top_sequences_df = all_sequences_scored.nlargest(top_k, 'importance_score')
-        top_sequences_df = top_sequences_df[['junction_aa', 'v_call', 'j_call']]
+        # Aggregate scores for each sequence
+        aggregated_scores = {}
+        for key, scores in self.sequence_scores_.items():
+            # Mean of attention scores weighted by label
+            aggregated_scores[key] = np.mean(scores)
+        
+        # Sort by score and get top k
+        sorted_sequences = sorted(aggregated_scores.items(), key=lambda x: x[1], reverse=True)
+        top_sequences = sorted_sequences[:top_k]
+        
+        # Build DataFrame
+        rows = []
+        for i, ((seq, v, j), score) in enumerate(top_sequences):
+            rows.append({
+                'junction_aa': seq,
+                'v_call': v,
+                'j_call': j,
+                'importance_score': score
+            })
+        
+        top_sequences_df = pd.DataFrame(rows)
         top_sequences_df['dataset'] = dataset_name
-        top_sequences_df['ID'] = range(1, len(top_sequences_df)+1)
+        top_sequences_df['ID'] = range(1, len(top_sequences_df) + 1)
         top_sequences_df['ID'] = top_sequences_df['dataset'] + '_seq_top_' + top_sequences_df['ID'].astype(str)
-        top_sequences_df['label_positive_probability'] = -999.0 # to enable compatibility with the expected output format
+        top_sequences_df['label_positive_probability'] = -999.0
         top_sequences_df = top_sequences_df[['ID', 'dataset', 'label_positive_probability', 'junction_aa', 'v_call', 'j_call']]
 
         # --- your code ends here ---
