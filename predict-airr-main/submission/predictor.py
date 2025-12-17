@@ -209,16 +209,24 @@ class ImmuneStatePredictor:
             self.device = 'cpu'
         else:
             self.device = device
-        # --- your code starts here ---
-        # Example: Store hyperparameters, the actual model, identified important sequences, etc.
-
-        # NOTE: we encourage you to use self.n_jobs and self.device if appropriate in
-        # your implementation instead of hardcoding these values because your code may later be run in an
-        # environment with different hardware resources.
-
-        self.model = None
+        # Hyperparameters
+        self.max_clonotypes = kwargs.get('max_clonotypes', 2000)
+        self.max_seq_len = kwargs.get('max_seq_len', 25)
+        self.batch_size = kwargs.get('batch_size', 24)
+        self.n_epochs = kwargs.get('n_epochs', 12)
+        self.n_folds = kwargs.get('n_folds', 2)
+        self.learning_rate = kwargs.get('learning_rate', 1e-3)
+        self.weight_decay = kwargs.get('weight_decay', 1e-4)
+        self.seq_hidden_dim = kwargs.get('seq_hidden_dim', 96)
+        self.gene_embed_dim = kwargs.get('gene_embed_dim', 24)
+        self.attention_hidden_dim = kwargs.get('attention_hidden_dim', 96)
+        self.dropout = kwargs.get('dropout', 0.25)
+        
+        # Model components (initialized during fit)
+        self.models = []  # List of trained models for ensemble
+        self.gene_encoder = None
         self.important_sequences_ = None
-        # --- your code ends here ---
+        self.sequence_scores_ = {}
 
     def fit(self, train_dir_path: str):
         """
@@ -232,19 +240,183 @@ class ImmuneStatePredictor:
         """
 
         # --- your code starts here ---
-        # Load the data, prepare suited representations as needed, train your model,
-        # and find the top k important sequences that best explain the labels.
-        # Example: Load the data. One possibility could be to use the provided utility function as shown below.
-
-        # full_train_dataset_df = load_full_dataset(train_dir_path)
-
-        #   Model Training
-        #    Example: self.model = SomeClassifier().fit(X_train, y_train)
-        self.model = "some trained model"  # Replace with your actual learnt model
-
-        #   Identify important sequences (can be done here or in the dedicated method)
-        #    Example:
-        self.important_sequences_ = self.identify_associated_sequences(top_k=50000, dataset_name=os.path.basename(train_dir_path))
+        print(f"Loading training data from {train_dir_path}...")
+        
+        # Load full dataset
+        full_df = load_full_dataset(train_dir_path)
+        
+        # Initialize gene encoder with all genes
+        self.gene_encoder = GeneEncoder()
+        all_v_genes = full_df['v_call'].dropna().unique().tolist()
+        all_j_genes = full_df['j_call'].dropna().unique().tolist()
+        self.gene_encoder.fit(all_v_genes, all_j_genes)
+        
+        # Get repertoire info
+        repertoire_ids = full_df['repertoire_id'].unique()
+        labels = full_df.groupby('repertoire_id')['label'].first().values
+        
+        print(f"Training on {len(repertoire_ids)} repertoires, {len(full_df)} total clonotypes")
+        print(f"Class distribution: {np.mean(labels):.2%} positive")
+        
+        # Cross-validation training
+        skf = StratifiedKFold(n_splits=self.n_folds, shuffle=True, random_state=42)
+        self.models = []
+        
+        for fold, (train_idx, val_idx) in enumerate(skf.split(repertoire_ids, labels)):
+            print(f"\n--- Fold {fold + 1}/{self.n_folds} ---")
+            
+            train_rep_ids = repertoire_ids[train_idx]
+            val_rep_ids = repertoire_ids[val_idx]
+            
+            train_df = full_df[full_df['repertoire_id'].isin(train_rep_ids)]
+            val_df = full_df[full_df['repertoire_id'].isin(val_rep_ids)]
+            
+            # Create datasets
+            train_dataset = RepertoireDataset(
+                train_df, self.gene_encoder, 
+                max_clonotypes=self.max_clonotypes, 
+                max_seq_len=self.max_seq_len
+            )
+            val_dataset = RepertoireDataset(
+                val_df, self.gene_encoder,
+                max_clonotypes=self.max_clonotypes,
+                max_seq_len=self.max_seq_len
+            )
+            
+            train_loader = DataLoader(
+                train_dataset, batch_size=self.batch_size, 
+                shuffle=True, collate_fn=collate_fn, num_workers=0
+            )
+            val_loader = DataLoader(
+                val_dataset, batch_size=self.batch_size,
+                shuffle=False, collate_fn=collate_fn, num_workers=0
+            )
+            
+            # Initialize model
+            model = MILClassifier(
+                n_v_genes=self.gene_encoder.n_v_genes,
+                n_j_genes=self.gene_encoder.n_j_genes,
+                seq_hidden=self.seq_hidden_dim,
+                gene_embed=self.gene_embed_dim,
+                attention_hidden=self.attention_hidden_dim,
+                dropout=self.dropout
+            ).to(self.device)
+            
+            optimizer = AdamW(model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
+            scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2)
+            criterion = CombinedLoss()
+            
+            best_auc = 0.0
+            best_state = None
+            
+            for epoch in range(self.n_epochs):
+                # Training
+                model.train()
+                train_loss = 0.0
+                
+                for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False):
+                    seq_enc = batch['seq_encodings'].to(self.device)
+                    v_idx = batch['v_indices'].to(self.device)
+                    j_idx = batch['j_indices'].to(self.device)
+                    mask = batch['mask'].to(self.device)
+                    labels_batch = batch['labels'].float().to(self.device)
+                    
+                    optimizer.zero_grad()
+                    logits, attn = model(seq_enc, v_idx, j_idx, mask)
+                    loss = criterion(logits, labels_batch, attn, mask)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    train_loss += loss.item()
+                
+                scheduler.step()
+                
+                # Validation
+                model.eval()
+                val_preds = []
+                val_labels = []
+                
+                with torch.no_grad():
+                    for batch in val_loader:
+                        seq_enc = batch['seq_encodings'].to(self.device)
+                        v_idx = batch['v_indices'].to(self.device)
+                        j_idx = batch['j_indices'].to(self.device)
+                        mask = batch['mask'].to(self.device)
+                        
+                        logits, _ = model(seq_enc, v_idx, j_idx, mask)
+                        probs = torch.sigmoid(logits).cpu().numpy()
+                        val_preds.extend(probs)
+                        val_labels.extend(batch['labels'].numpy())
+                
+                val_auc = roc_auc_score(val_labels, val_preds)
+                print(f"Epoch {epoch+1}: Loss={train_loss/len(train_loader):.4f}, Val AUC={val_auc:.4f}")
+                
+                if val_auc > best_auc:
+                    best_auc = val_auc
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            
+            # Load best model
+            model.load_state_dict(best_state)
+            model.eval()
+            self.models.append(model)
+            print(f"Fold {fold+1} best AUC: {best_auc:.4f}")
+        
+        # Identify important sequences using attention scores
+        self._collect_sequence_scores(full_df)
+        self.important_sequences_ = self.identify_associated_sequences(
+            top_k=50000, dataset_name=os.path.basename(train_dir_path)
+        )
+        
+        # --- your code ends here ---
+        print("\nTraining complete.")
+        return self
+    
+    def _collect_sequence_scores(self, df: pd.DataFrame):
+        """Collect attention scores for all sequences across models."""
+        print("Collecting sequence attention scores...")
+        
+        repertoire_ids = df['repertoire_id'].unique()
+        
+        for rep_id in tqdm(repertoire_ids, desc="Scoring sequences"):
+            rep_df = df[df['repertoire_id'] == rep_id]
+            label = rep_df['label'].iloc[0]
+            
+            # Sample sequences
+            if len(rep_df) > self.max_clonotypes:
+                rep_df = rep_df.nlargest(self.max_clonotypes, 'duplicate_count')
+            
+            sequences = rep_df['junction_aa'].tolist()
+            v_calls = rep_df['v_call'].tolist()
+            j_calls = rep_df['j_call'].tolist()
+            
+            # Encode
+            seq_encodings = []
+            for seq in sequences:
+                enc = encode_sequence_atchley(seq, self.max_seq_len)
+                seq_encodings.append(enc)
+            
+            seq_tensor = torch.tensor(np.array(seq_encodings), dtype=torch.float32).unsqueeze(0).to(self.device)
+            v_tensor = torch.tensor([self.gene_encoder.encode_v(v) for v in v_calls], dtype=torch.long).unsqueeze(0).to(self.device)
+            j_tensor = torch.tensor([self.gene_encoder.encode_j(j) for j in j_calls], dtype=torch.long).unsqueeze(0).to(self.device)
+            mask = torch.ones(1, len(sequences), dtype=torch.float32).to(self.device)
+            
+            # Get attention scores from all models
+            all_scores = []
+            with torch.no_grad():
+                for model in self.models:
+                    _, attn = model(seq_tensor, v_tensor, j_tensor, mask)
+                    all_scores.append(attn.cpu().numpy()[0])
+            
+            avg_scores = np.mean(all_scores, axis=0)
+            
+            # Weight by label (positive samples contribute positively)
+            label_weight = 1.0 if label == 1 else -0.5
+            
+            for i, (seq, v, j) in enumerate(zip(sequences, v_calls, j_calls)):
+                key = (seq, v, j)
+                if key not in self.sequence_scores_:
+                    self.sequence_scores_[key] = []
+                self.sequence_scores_[key].append(avg_scores[i] * label_weight)
 
         # --- your code ends here ---
         print("Training complete.")
